@@ -904,6 +904,20 @@ namespace Unity.Netcode
         }
 
         /// <summary>
+        /// Gets the transportId associated with the clientId
+        /// </summary>
+        /// <param name="clientId">The ClientId to get the TransportId for</param>
+        /// <returns></returns>
+        public ulong GetTransportIdFromClientId(ulong clientId) => ConnectionManager.ClientIdToTransportId(clientId);
+
+        /// <summary>
+        /// Gets the clientId associated with the transportId
+        /// </summary>
+        /// <param name="transportId">The TransportId to get the ClientId for</param>
+        /// <returns></returns>
+        public ulong GetClientIdFromTransportId(ulong transportId) => ConnectionManager.TransportIdToClientId(transportId);
+
+        /// <summary>
         /// Disconnects the remote client.
         /// </summary>
         /// <param name="clientId">The ClientId to disconnect</param>
