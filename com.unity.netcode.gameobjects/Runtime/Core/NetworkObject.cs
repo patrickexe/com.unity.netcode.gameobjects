@@ -1,8 +1,17 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
+#if UNITY_EDITOR
+using UnityEditor;
+#if UNITY_2021_2_OR_NEWER
+using UnityEditor.SceneManagement;
+#else
+using UnityEditor.Experimental.SceneManagement;
+#endif
+#endif
 using UnityEngine;
 using UnityEngine.SceneManagement;
+
 
 namespace Unity.Netcode
 {
@@ -18,6 +27,22 @@ namespace Unity.Netcode
         internal uint GlobalObjectIdHash;
 
         /// <summary>
+        /// Used to track the source GlobalObjectIdHash value of the associated network prefab.
+        /// When an override exists or it is in-scene placed, GlobalObjectIdHash and PrefabGlobalObjectIdHash
+        /// will be different. The PrefabGlobalObjectIdHash value is what is used when sending a <see cref="CreateObjectMessage"/>.
+        /// </summary>
+        internal uint PrefabGlobalObjectIdHash;
+
+        /// <summary>
+        /// This is the source prefab of an in-scene placed NetworkObject. This is not set for in-scene 
+        /// placd NetworkObjects that are not prefab instances, dynamically spawned prefab instances,
+        /// or for network prefab assets.
+        /// </summary>
+        [HideInInspector]
+        [SerializeField]
+        internal uint InScenePlacedSourceGlobalObjectIdHash;
+
+        /// <summary>
         /// Gets the Prefab Hash Id of this object if the object is registerd as a prefab otherwise it returns 0
         /// </summary>
         [HideInInspector]
@@ -25,42 +50,205 @@ namespace Unity.Netcode
         {
             get
             {
-                foreach (var prefab in NetworkManager.NetworkConfig.Prefabs.Prefabs)
-                {
-                    if (prefab.Prefab == gameObject)
-                    {
-                        return GlobalObjectIdHash;
-                    }
-                }
-
-                return 0;
+                return GlobalObjectIdHash;
             }
         }
 
-        private bool m_IsPrefab;
-
 #if UNITY_EDITOR
-        private void OnValidate()
+        private const string k_GlobalIdTemplate = "GlobalObjectId_V1-{0}-{1}-{2}-{3}";
+
+        /// <summary>
+        /// Object Types <see href="https://docs.unity3d.com/ScriptReference/GlobalObjectId.html"/>
+        /// Parameter 0 of <see cref="k_GlobalIdTemplate"/>
+        /// </summary>
+        // 0 = Null (when considered a null object type we can ignore)
+        // 1 = Imported Asset
+        // 2 = Scene Object
+        // 3 = Source Asset.
+        private const int k_NullObjectType = 0;
+        private const int k_ImportedAssetObjectType = 1;
+        private const int k_SceneObjectType = 2;
+        private const int k_SourceAssetObjectType = 3;
+
+        [ContextMenu("Refresh In-Scene Prefab Instances")]
+        internal void RefreshAllPrefabInstances()
         {
-            GenerateGlobalObjectIdHash();
+            var instanceGlobalId = GlobalObjectId.GetGlobalObjectIdSlow(this);
+            if (!PrefabUtility.IsPartOfAnyPrefab(this) || instanceGlobalId.identifierType != k_ImportedAssetObjectType)
+            {
+                EditorUtility.DisplayDialog("Network Prefab Assets Only", "This action can only be performed on a network prefab asset.", "Ok");
+                return;
+            }
+
+            // Handle updating the currently active scene
+            var networkObjects = FindObjectsByType<NetworkObject>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+            foreach (var networkObject in networkObjects)
+            {
+                networkObject.OnValidate();
+            }
+            NetworkObjectRefreshTool.ProcessActiveScene();
+
+            // Refresh all build settings scenes
+            var activeScene = SceneManager.GetActiveScene();
+            foreach (var editorScene in EditorBuildSettings.scenes)
+            {
+                // skip disabled scenes and the currently active scene
+                if (!editorScene.enabled || activeScene.path == editorScene.path)
+                {
+                    continue;
+                }
+                // Add the scene to be processed
+                NetworkObjectRefreshTool.ProcessScene(editorScene.path, false);
+            }
+
+            // Process all added scenes
+            NetworkObjectRefreshTool.ProcessScenes();
         }
 
-        internal void GenerateGlobalObjectIdHash()
+        private void OnValidate()
         {
             // do NOT regenerate GlobalObjectIdHash for NetworkPrefabs while Editor is in PlayMode
-            if (UnityEditor.EditorApplication.isPlaying && !string.IsNullOrEmpty(gameObject.scene.name))
+            if (EditorApplication.isPlaying && !string.IsNullOrEmpty(gameObject.scene.name))
             {
                 return;
             }
 
             // do NOT regenerate GlobalObjectIdHash if Editor is transitioning into or out of PlayMode
-            if (!UnityEditor.EditorApplication.isPlaying && UnityEditor.EditorApplication.isPlayingOrWillChangePlaymode)
+            if (!EditorApplication.isPlaying && EditorApplication.isPlayingOrWillChangePlaymode)
             {
                 return;
             }
 
-            var globalObjectIdString = UnityEditor.GlobalObjectId.GetGlobalObjectIdSlow(this).ToString();
-            GlobalObjectIdHash = XXHash.Hash32(globalObjectIdString);
+            // Get a global object identifier for this network prefab
+            var globalId = GetGlobalId();
+
+
+            // if the identifier type is 0, then don't update the GlobalObjectIdHash
+            if (globalId.identifierType == k_NullObjectType)
+            {
+                return;
+            }
+
+            var oldValue = GlobalObjectIdHash;
+            GlobalObjectIdHash = globalId.ToString().Hash32();
+
+            // If the GlobalObjectIdHash value changed, then mark the asset dirty
+            if (GlobalObjectIdHash != oldValue)
+            {
+                // Check if this is an in-scnee placed NetworkObject (Special Case for In-Scene Placed)
+                if (!IsEditingPrefab() && gameObject.scene.name != null && gameObject.scene.name != gameObject.name)
+                {
+                    // Sanity check to make sure this is a scene placed object
+                    if (globalId.identifierType != k_SceneObjectType)
+                    {
+                        // This should never happen, but in the event it does throw and error
+                        Debug.LogError($"[{gameObject.name}] is detected as an in-scene placed object but its identifier is of type {globalId.identifierType}! **Report this error**");
+                    }
+
+                    // If this is a prefab instance
+                    if (PrefabUtility.IsPartOfAnyPrefab(this))
+                    {
+                        // We must invoke this in order for the modifications to get saved with the scene (does not mark scene as dirty)
+                        PrefabUtility.RecordPrefabInstancePropertyModifications(this);
+                    }
+                }
+                else // Otherwise, this is a standard network prefab asset so we just mark it dirty for the AssetDatabase to update it
+                {
+                    EditorUtility.SetDirty(this);
+                }
+            }
+
+            // Always check for in-scene placed to assure any previous version scene assets with in-scene place NetworkObjects gets updated
+            CheckForInScenePlaced();
+        }
+
+        private bool IsEditingPrefab()
+        {
+            // Check if we are directly editing the prefab
+            var stage = PrefabStageUtility.GetPrefabStage(gameObject);
+
+            // if we are not editing the prefab directly (or a sub-prefab), then return the object identifier
+            if (stage == null || stage.assetPath == null)
+            {
+                return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// This checks to see if this NetworkObject is an in-scene placed prefab instance. If so it will 
+        /// automatically find the source prefab asset's GlobalObjectIdHash value, assign it to 
+        /// InScenePlacedSourceGlobalObjectIdHash and mark this as being in-scene placed.
+        /// </summary>
+        /// <remarks>
+        /// This NetworkObject is considered an in-scene placed prefab asset instance if it is:
+        /// - Part of a prefab
+        /// - Not being directly edited
+        /// - Within a valid scene that is part of the scenes in build list
+        /// (In-scene defined NetworkObjects that are not part of a prefab instance are excluded.)
+        /// </remarks>
+        private void CheckForInScenePlaced()
+        {
+            if (PrefabUtility.IsPartOfAnyPrefab(this) && !IsEditingPrefab() && gameObject.scene.IsValid() && gameObject.scene.isLoaded && gameObject.scene.buildIndex >= 0)
+            {
+                var prefab = PrefabUtility.GetCorrespondingObjectFromSource(gameObject);
+                var assetPath = AssetDatabase.GetAssetPath(prefab);
+                var sourceAsset = AssetDatabase.LoadAssetAtPath<NetworkObject>(assetPath);
+                if (sourceAsset != null && sourceAsset.GlobalObjectIdHash != 0 && InScenePlacedSourceGlobalObjectIdHash != sourceAsset.GlobalObjectIdHash)
+                {
+                    InScenePlacedSourceGlobalObjectIdHash = sourceAsset.GlobalObjectIdHash;
+                }
+                IsSceneObject = true;
+            }
+        }
+
+        private GlobalObjectId GetGlobalId()
+        {
+            var instanceGlobalId = GlobalObjectId.GetGlobalObjectIdSlow(this);
+
+            // If not editing a prefab, then just use the generated id
+            if (!IsEditingPrefab())
+            {
+                return instanceGlobalId;
+            }
+
+            // If the asset doesn't exist at the given path, then return the object identifier
+            var prefabStageAssetPath = PrefabStageUtility.GetPrefabStage(gameObject).assetPath;
+            // If (for some reason) the asset path is null return the generated id
+            if (prefabStageAssetPath == null)
+            {
+                return instanceGlobalId;
+            }
+
+            var theAsset = AssetDatabase.LoadAssetAtPath<NetworkObject>(prefabStageAssetPath);
+            // If there is no asset at that path (for some odd/edge case reason), return the generated id
+            if (theAsset == null)
+            {
+                return instanceGlobalId;
+            }
+
+            // If we can't get the asset GUID and/or the file identifier, then return the object identifier
+            if (!AssetDatabase.TryGetGUIDAndLocalFileIdentifier(theAsset, out var guid, out long localFileId))
+            {
+                return instanceGlobalId;
+            }
+
+            // Note: If we reached this point, then we are most likely opening a prefab to edit.
+            // The instanceGlobalId will be constructed as if it is a scene object, however when it
+            // is serialized its value will be treated as a file asset (the "why" to the below code).
+
+            // Construct an imported asset identifier with the type being a source asset object type
+            var prefabGlobalIdText = string.Format(k_GlobalIdTemplate, k_SourceAssetObjectType, guid, (ulong)localFileId, 0);
+
+            // If we can't parse the result log an error and return the instanceGlobalId
+            if (!GlobalObjectId.TryParse(prefabGlobalIdText, out var prefabGlobalId))
+            {
+                Debug.LogError($"[GlobalObjectId Gen] Failed to parse ({prefabGlobalIdText}) returning default ({instanceGlobalId})! ** Please Report This Error **");
+                return instanceGlobalId;
+            }
+
+            // Otherwise, return the constructed identifier for the source prefab asset
+            return prefabGlobalId;
         }
 #endif // UNITY_EDITOR
 
@@ -553,7 +741,7 @@ namespace Unity.Netcode
                     // Since we still have a session connection, log locally and on the server to inform user of this issue.
                     if (NetworkManager.LogLevel <= LogLevel.Error)
                     {
-                        NetworkLog.LogErrorServer($"Destroy a spawned {nameof(NetworkObject)} on a non-host client is not valid. Call {nameof(Destroy)} or {nameof(Despawn)} on the server/host instead.");
+                        NetworkLog.LogErrorServer($"[Invalid Destroy][{gameObject.name}][NetworkObjectId:{NetworkObjectId}] Destroy a spawned {nameof(NetworkObject)} on a non-host client is not valid. Call {nameof(Destroy)} or {nameof(Despawn)} on the server/host instead.");
                     }
                     return;
                 }
@@ -570,7 +758,7 @@ namespace Unity.Netcode
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void SpawnInternal(bool destroyWithScene, ulong ownerClientId, bool playerObject)
+        internal void SpawnInternal(bool destroyWithScene, ulong ownerClientId, bool playerObject)
         {
             if (!NetworkManager.IsListening)
             {
@@ -591,6 +779,78 @@ namespace Unity.Netcode
                     NetworkManager.SpawnManager.SendSpawnCallForObject(NetworkManager.ConnectedClientsList[i].ClientId, this);
                 }
             }
+        }
+
+        /// <summary>
+        /// This invokes <see cref="NetworkSpawnManager.InstantiateAndSpawn(NetworkObject, ulong, bool, bool, bool, Vector3, Quaternion)"/>.
+        /// </summary>
+        /// <param name="networkPrefab">The NetworkPrefab to instantiate and spawn.</param>
+        /// <param name="networkManager">The local instance of the NetworkManager connected to an session in progress.</param>
+        /// <param name="ownerClientId">The owner of the <see cref="NetworkObject"/> instance (defaults to server).</param>
+        /// <param name="destroyWithScene">Whether the <see cref="NetworkObject"/> instance will be destroyed when the scene it is located within is unloaded (default is false).</param>
+        /// <param name="isPlayerObject">Whether the <see cref="NetworkObject"/> instance is a player object or not (default is false).</param>
+        /// <param name="forceOverride">Whether you want to force spawning the override when running as a host or server or if you want it to spawn the override for host mode and
+        /// the source prefab for server. If there is an override, clients always spawn that as opposed to the source prefab (defaults to false).  </param>
+        /// <param name="position">The starting poisiton of the <see cref="NetworkObject"/> instance.</param>
+        /// <param name="rotation">The starting rotation of the <see cref="NetworkObject"/> instance.</param>
+        /// <returns>The newly instantiated and spawned <see cref="NetworkObject"/> prefab instance.</returns>
+        public static NetworkObject InstantiateAndSpawn(GameObject networkPrefab, NetworkManager networkManager, ulong ownerClientId = NetworkManager.ServerClientId, bool destroyWithScene = false, bool isPlayerObject = false, bool forceOverride = false, Vector3 position = default, Quaternion rotation = default)
+        {
+            var networkObject = networkPrefab.GetComponent<NetworkObject>();
+            if (networkObject == null)
+            {
+                Debug.LogError($"The {nameof(NetworkPrefab)} {networkPrefab.name} does not have a {nameof(NetworkObject)} component!");
+                return null;
+            }
+            return networkObject.InstantiateAndSpawn(networkManager, ownerClientId, destroyWithScene, isPlayerObject, forceOverride, position, rotation);
+        }
+
+        /// <summary>
+        /// This invokes <see cref="NetworkSpawnManager.InstantiateAndSpawn(NetworkObject, ulong, bool, bool, bool, Vector3, Quaternion)"/>.
+        /// </summary>
+        /// <param name="networkManager">The local instance of the NetworkManager connected to an session in progress.</param>
+        /// <param name="ownerClientId">The owner of the <see cref="NetworkObject"/> instance (defaults to server).</param>
+        /// <param name="destroyWithScene">Whether the <see cref="NetworkObject"/> instance will be destroyed when the scene it is located within is unloaded (default is false).</param>
+        /// <param name="isPlayerObject">Whether the <see cref="NetworkObject"/> instance is a player object or not (default is false).</param>
+        /// <param name="forceOverride">Whether you want to force spawning the override when running as a host or server or if you want it to spawn the override for host mode and
+        /// the source prefab for server. If there is an override, clients always spawn that as opposed to the source prefab (defaults to false).  </param>
+        /// <param name="position">The starting poisiton of the <see cref="NetworkObject"/> instance.</param>
+        /// <param name="rotation">The starting rotation of the <see cref="NetworkObject"/> instance.</param>
+        /// <returns>The newly instantiated and spawned <see cref="NetworkObject"/> prefab instance.</returns>
+        public NetworkObject InstantiateAndSpawn(NetworkManager networkManager, ulong ownerClientId = NetworkManager.ServerClientId, bool destroyWithScene = false, bool isPlayerObject = false, bool forceOverride = false, Vector3 position = default, Quaternion rotation = default)
+        {
+            if (networkManager == null)
+            {
+                Debug.LogError(NetworkSpawnManager.InstantiateAndSpawnErrors[NetworkSpawnManager.InstantiateAndSpawnErrorTypes.NetworkManagerNull]);
+                return null;
+            }
+
+            if (!networkManager.IsListening)
+            {
+                Debug.LogError(NetworkSpawnManager.InstantiateAndSpawnErrors[NetworkSpawnManager.InstantiateAndSpawnErrorTypes.NoActiveSession]);
+                return null;
+            }
+
+            if (!networkManager.IsServer)
+            {
+                Debug.LogError(NetworkSpawnManager.InstantiateAndSpawnErrors[NetworkSpawnManager.InstantiateAndSpawnErrorTypes.NotAuthority]);
+                return null;
+            }
+
+            if (NetworkManager.ShutdownInProgress)
+            {
+                Debug.LogWarning(NetworkSpawnManager.InstantiateAndSpawnErrors[NetworkSpawnManager.InstantiateAndSpawnErrorTypes.InvokedWhenShuttingDown]);
+                return null;
+            }
+
+            // Verify it is actually a valid prefab
+            if (!NetworkManager.NetworkConfig.Prefabs.Contains(gameObject))
+            {
+                Debug.LogError(NetworkSpawnManager.InstantiateAndSpawnErrors[NetworkSpawnManager.InstantiateAndSpawnErrorTypes.NotRegisteredNetworkPrefab]);
+                return null;
+            }
+
+            return NetworkManager.SpawnManager.InstantiateAndSpawnNoParameterChecks(this, ownerClientId, destroyWithScene, isPlayerObject, forceOverride, position, rotation);
         }
 
         /// <summary>
@@ -676,6 +936,21 @@ namespace Unity.Netcode
                 if (ChildNetworkBehaviours[i].gameObject.activeInHierarchy)
                 {
                     ChildNetworkBehaviours[i].InternalOnGainedOwnership();
+                }
+                else
+                {
+                    Debug.LogWarning($"{ChildNetworkBehaviours[i].gameObject.name} is disabled! Netcode for GameObjects does not support disabled NetworkBehaviours! The {ChildNetworkBehaviours[i].GetType().Name} component was skipped during ownership assignment!");
+                }
+            }
+        }
+
+        internal void InvokeOwnershipChanged(ulong previous, ulong next)
+        {
+            for (int i = 0; i < ChildNetworkBehaviours.Count; i++)
+            {
+                if (ChildNetworkBehaviours[i].gameObject.activeInHierarchy)
+                {
+                    ChildNetworkBehaviours[i].InternalOnOwnershipChanged(previous, next);
                 }
                 else
                 {
@@ -804,20 +1079,21 @@ namespace Unity.Netcode
                 return false;
             }
 
-            if (!NetworkManager.IsServer)
+            if (!NetworkManager.IsServer && !NetworkManager.ShutdownInProgress)
             {
                 return false;
             }
 
-            if (!IsSpawned)
+            // If the parent is not null fail only if either of the two is true:
+            // - This instance is spawned and the parent is not.
+            // - This instance is not spawned and the parent is.
+            // Basically, don't allow parenting when either the child or parent is not spawned.
+            // Caveat: if the parent is null then we can allow parenting whether the instance is or is not spawned.
+            if (parent != null && (IsSpawned ^ parent.IsSpawned))
             {
                 return false;
             }
 
-            if (parent != null && !parent.IsSpawned)
-            {
-                return false;
-            }
             m_CachedWorldPositionStays = worldPositionStays;
 
             if (parent == null)
@@ -853,15 +1129,36 @@ namespace Unity.Netcode
 
             if (!NetworkManager.IsServer)
             {
-                transform.parent = m_CachedParent;
-                Debug.LogException(new NotServerException($"Only the server can reparent {nameof(NetworkObject)}s"));
+                // Log exception if we are a client and not shutting down.
+                if (!NetworkManager.ShutdownInProgress)
+                {
+                    transform.parent = m_CachedParent;
+                    Debug.LogException(new NotServerException($"Only the server can reparent {nameof(NetworkObject)}s"));
+                }
+                else // Otherwise, if we are removing a parent then go ahead and allow parenting to occur
+                if (transform.parent == null)
+                {
+                    m_LatestParent = null;
+                    m_CachedParent = null;
+                    InvokeBehaviourOnNetworkObjectParentChanged(null);
+                }
                 return;
             }
-
+            else // Otherwise, on the serer side if this instance is not spawned...
             if (!IsSpawned)
             {
-                transform.parent = m_CachedParent;
-                Debug.LogException(new SpawnStateException($"{nameof(NetworkObject)} can only be reparented after being spawned"));
+                // ,,,and we are removing the parent, then go ahead and allow parenting to occur
+                if (transform.parent == null)
+                {
+                    m_LatestParent = null;
+                    m_CachedParent = null;
+                    InvokeBehaviourOnNetworkObjectParentChanged(null);
+                }
+                else
+                {
+                    transform.parent = m_CachedParent;
+                    Debug.LogException(new SpawnStateException($"{nameof(NetworkObject)} can only be reparented after being spawned"));
+                }
                 return;
             }
             var removeParent = false;
@@ -1190,7 +1487,7 @@ namespace Unity.Netcode
             return 0;
         }
 
-        internal NetworkBehaviour GetNetworkBehaviourAtOrderIndex(ushort index)
+        public NetworkBehaviour GetNetworkBehaviourAtOrderIndex(ushort index)
         {
             if (index >= ChildNetworkBehaviours.Count)
             {
@@ -1704,16 +2001,39 @@ namespace Unity.Netcode
         /// <returns></returns>
         internal uint HostCheckForGlobalObjectIdHashOverride()
         {
-            if (NetworkManager.IsHost)
+            if (NetworkManager.IsServer)
             {
                 if (NetworkManager.PrefabHandler.ContainsHandler(this))
                 {
                     var globalObjectIdHash = NetworkManager.PrefabHandler.GetSourceGlobalObjectIdHash(GlobalObjectIdHash);
                     return globalObjectIdHash == 0 ? GlobalObjectIdHash : globalObjectIdHash;
                 }
-                if (NetworkManager.NetworkConfig.Prefabs.OverrideToNetworkPrefab.TryGetValue(GlobalObjectIdHash, out uint hash))
+
+                // If scene management is disabled and this is an in-scene placed NetworkObject then go ahead
+                // and send the InScenePlacedSourcePrefab's GlobalObjectIdHash value (i.e. what to dynamically spawn)
+                if (!NetworkManager.NetworkConfig.EnableSceneManagement && IsSceneObject.Value && InScenePlacedSourceGlobalObjectIdHash != 0)
                 {
-                    return hash;
+                    return InScenePlacedSourceGlobalObjectIdHash;
+                }
+
+                // If the PrefabGlobalObjectIdHash is a non-zero value and the GlobalObjectIdHash value is
+                // different from the PrefabGlobalObjectIdHash value, then the NetworkObject instance is
+                // an override for the original network prefab (i.e. PrefabGlobalObjectIdHash)
+                if (!IsSceneObject.Value && GlobalObjectIdHash != PrefabGlobalObjectIdHash)
+                {
+                    // If the PrefabGlobalObjectIdHash is already populated (i.e. InstantiateAndSpawn used), then return this
+                    if (PrefabGlobalObjectIdHash != 0)
+                    {
+                        return PrefabGlobalObjectIdHash;
+                    }
+                    else
+                    {
+                        // For legacy manual instantiation and spawning, check the OverrideToNetworkPrefab for a possible match
+                        if (NetworkManager.NetworkConfig.Prefabs.OverrideToNetworkPrefab.ContainsKey(GlobalObjectIdHash))
+                        {
+                            return NetworkManager.NetworkConfig.Prefabs.OverrideToNetworkPrefab[GlobalObjectIdHash];
+                        }
+                    }
                 }
             }
 

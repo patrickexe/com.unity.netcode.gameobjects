@@ -3,27 +3,54 @@ using System.Collections.Generic;
 using Unity.Collections;
 using UnityEngine;
 
+
 namespace Unity.Netcode
 {
+    public class RpcException : Exception
+    {
+        public RpcException(string message) : base(message)
+        {
+
+        }
+    }
+
     /// <summary>
     /// The base class to override to write network code. Inherits MonoBehaviour
     /// </summary>
     public abstract class NetworkBehaviour : MonoBehaviour
     {
 #pragma warning disable IDE1006 // disable naming rule violation check
+
+        // RuntimeAccessModifiersILPP will make this `public`
+        internal delegate void RpcReceiveHandler(NetworkBehaviour behaviour, FastBufferReader reader, __RpcParams parameters);
+
+        // RuntimeAccessModifiersILPP will make this `public`
+        internal static readonly Dictionary<Type, Dictionary<uint, RpcReceiveHandler>> __rpc_func_table = new Dictionary<Type, Dictionary<uint, RpcReceiveHandler>>();
+
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+        // RuntimeAccessModifiersILPP will make this `public`
+        internal static readonly Dictionary<Type, Dictionary<uint, string>> __rpc_name_table = new Dictionary<Type, Dictionary<uint, string>>();
+#endif
+
         // RuntimeAccessModifiersILPP will make this `protected`
         internal enum __RpcExecStage
         {
+            // Technically will overlap with None and Server
+            // but it doesn't matter since we don't use None and Server
+            Send = 0,
+            Execute = 1,
+
+            // Backward compatibility, not used...
             None = 0,
             Server = 1,
-            Client = 2
+            Client = 2,
         }
         // NetworkBehaviourILPP will override this in derived classes to return the name of the concrete type
         internal virtual string __getTypeName() => nameof(NetworkBehaviour);
 
         [NonSerialized]
         // RuntimeAccessModifiersILPP will make this `protected`
-        internal __RpcExecStage __rpc_exec_stage = __RpcExecStage.None;
+        internal __RpcExecStage __rpc_exec_stage = __RpcExecStage.Send;
 #pragma warning restore IDE1006 // restore naming rule violation check
 
         private const int k_RpcMessageDefaultSize = 1024; // 1k
@@ -97,7 +124,7 @@ namespace Unity.Netcode
 
             bufferWriter.Dispose();
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
-            if (NetworkManager.__rpc_name_table.TryGetValue(rpcMethodId, out var rpcMethodName))
+            if (__rpc_name_table[GetType()].TryGetValue(rpcMethodId, out var rpcMethodName))
             {
                 NetworkManager.NetworkMetrics.TrackRpcSent(
                     NetworkManager.ServerClientId,
@@ -228,7 +255,7 @@ namespace Unity.Netcode
 
             bufferWriter.Dispose();
 #if DEVELOPMENT_BUILD || UNITY_EDITOR
-            if (NetworkManager.__rpc_name_table.TryGetValue(rpcMethodId, out var rpcMethodName))
+            if (__rpc_name_table[GetType()].TryGetValue(rpcMethodId, out var rpcMethodName))
             {
                 if (clientRpcParams.Send.TargetClientIds != null)
                 {
@@ -271,6 +298,99 @@ namespace Unity.Netcode
 #endif
         }
 
+
+#pragma warning disable IDE1006 // disable naming rule violation check
+        // RuntimeAccessModifiersILPP will make this `protected`
+        internal FastBufferWriter __beginSendRpc(uint rpcMethodId, RpcParams rpcParams, RpcAttribute.RpcAttributeParams attributeParams, SendTo defaultTarget, RpcDelivery rpcDelivery)
+#pragma warning restore IDE1006 // restore naming rule violation check
+        {
+            if (attributeParams.RequireOwnership && !IsOwner)
+            {
+                throw new RpcException("This RPC can only be sent by its owner.");
+            }
+            return new FastBufferWriter(k_RpcMessageDefaultSize, Allocator.Temp, k_RpcMessageMaximumSize);
+        }
+
+#pragma warning disable IDE1006 // disable naming rule violation check
+        // RuntimeAccessModifiersILPP will make this `protected`
+        internal void __endSendRpc(ref FastBufferWriter bufferWriter, uint rpcMethodId, RpcParams rpcParams, RpcAttribute.RpcAttributeParams attributeParams, SendTo defaultTarget, RpcDelivery rpcDelivery)
+#pragma warning restore IDE1006 // restore naming rule violation check
+        {
+            var rpcMessage = new RpcMessage
+            {
+                Metadata = new RpcMetadata
+                {
+                    NetworkObjectId = NetworkObjectId,
+                    NetworkBehaviourId = NetworkBehaviourId,
+                    NetworkRpcMethodId = rpcMethodId,
+                },
+                SenderClientId = NetworkManager.LocalClientId,
+                WriteBuffer = bufferWriter
+            };
+
+            NetworkDelivery networkDelivery;
+            switch (rpcDelivery)
+            {
+                default:
+                case RpcDelivery.Reliable:
+                    networkDelivery = NetworkDelivery.ReliableFragmentedSequenced;
+                    break;
+                case RpcDelivery.Unreliable:
+                    if (bufferWriter.Length > NetworkManager.MessageManager.NonFragmentedMessageMaxSize)
+                    {
+                        throw new OverflowException("RPC parameters are too large for unreliable delivery.");
+                    }
+                    networkDelivery = NetworkDelivery.Unreliable;
+                    break;
+            }
+
+            if (rpcParams.Send.Target == null)
+            {
+                switch (defaultTarget)
+                {
+                    case SendTo.Everyone:
+                        rpcParams.Send.Target = RpcTarget.Everyone;
+                        break;
+                    case SendTo.Owner:
+                        rpcParams.Send.Target = RpcTarget.Owner;
+                        break;
+                    case SendTo.Server:
+                        rpcParams.Send.Target = RpcTarget.Server;
+                        break;
+                    case SendTo.NotServer:
+                        rpcParams.Send.Target = RpcTarget.NotServer;
+                        break;
+                    case SendTo.NotMe:
+                        rpcParams.Send.Target = RpcTarget.NotMe;
+                        break;
+                    case SendTo.NotOwner:
+                        rpcParams.Send.Target = RpcTarget.NotOwner;
+                        break;
+                    case SendTo.Me:
+                        rpcParams.Send.Target = RpcTarget.Me;
+                        break;
+                    case SendTo.ClientsAndHost:
+                        rpcParams.Send.Target = RpcTarget.ClientsAndHost;
+                        break;
+                    case SendTo.SpecifiedInParams:
+                        throw new RpcException("This method requires a runtime-specified send target.");
+                }
+            }
+            else if (defaultTarget != SendTo.SpecifiedInParams && !attributeParams.AllowTargetOverride)
+            {
+                throw new RpcException("Target override is not allowed for this method.");
+            }
+
+            if (rpcParams.Send.LocalDeferMode == LocalDeferMode.Default)
+            {
+                rpcParams.Send.LocalDeferMode = attributeParams.DeferLocal ? LocalDeferMode.Defer : LocalDeferMode.SendImmediate;
+            }
+
+            rpcParams.Send.Target.Send(this, ref rpcMessage, networkDelivery, rpcParams);
+
+            bufferWriter.Dispose();
+        }
+
 #pragma warning disable IDE1006 // disable naming rule violation check
         // RuntimeAccessModifiersILPP will make this `protected`
         internal static NativeList<T> __createNativeList<T>() where T : unmanaged
@@ -302,6 +422,24 @@ namespace Unity.Netcode
             }
         }
 
+        // This erroneously tries to simplify these method references but the docs do not pick it up correctly
+        // because they try to resolve it on the field rather than the class of the same name.
+#pragma warning disable IDE0001
+        /// <summary>
+        /// Provides access to the various <see cref="SendTo"/> targets at runtime, as well as
+        /// runtime-bound targets like <see cref="Unity.Netcode.RpcTarget.Single"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Group(NativeArray{ulong})"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Group(NativeList{ulong})"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Group(ulong[])"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Group{T}(T)"/>, <see cref="Unity.Netcode.RpcTarget.Not(ulong)"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Not(NativeArray{ulong})"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Not(NativeList{ulong})"/>,
+        /// <see cref="Unity.Netcode.RpcTarget.Not(ulong[])"/>, and
+        /// <see cref="Unity.Netcode.RpcTarget.Not{T}(T)"/>
+        /// </summary>
+#pragma warning restore IDE0001
+        public RpcTarget RpcTarget => NetworkManager.RpcTarget;
+
         /// <summary>
         /// If a NetworkObject is assigned, it will return whether or not this NetworkObject
         /// is the local player object.  If no NetworkObject is assigned it will always return false.
@@ -317,6 +455,11 @@ namespace Unity.Netcode
         /// Gets if we are executing as server
         /// </summary>
         public bool IsServer { get; private set; }
+
+        /// <summary>
+        /// Gets if the server (local or remote) is a host - i.e., also a client
+        /// </summary>
+        public bool ServerIsHost { get; private set; }
 
         /// <summary>
         /// Gets if we are executing as client
@@ -459,12 +602,13 @@ namespace Unity.Netcode
                     IsHost = NetworkManager.IsListening && NetworkManager.IsHost;
                     IsClient = NetworkManager.IsListening && NetworkManager.IsClient;
                     IsServer = NetworkManager.IsListening && NetworkManager.IsServer;
+                    ServerIsHost = NetworkManager.IsListening && NetworkManager.ServerIsHost;
                 }
             }
             else // Shouldn't happen, but if so then set the properties to their default value;
             {
                 OwnerClientId = NetworkObjectId = default;
-                IsOwnedByServer = IsOwner = IsHost = IsClient = IsServer = default;
+                IsOwnedByServer = IsOwner = IsHost = IsClient = IsServer = ServerIsHost = default;
                 NetworkBehaviourId = default;
             }
         }
@@ -533,6 +677,23 @@ namespace Unity.Netcode
         }
 
         /// <summary>
+        /// Invoked on all clients, override this method to be notified of any
+        /// ownership changes (even if the instance was niether the previous or
+        /// newly assigned current owner). 
+        /// </summary>
+        /// <param name="previous">the previous owner</param>
+        /// <param name="current">the current owner</param>
+        protected virtual void OnOwnershipChanged(ulong previous, ulong current)
+        {
+
+        }
+
+        internal void InternalOnOwnershipChanged(ulong previous, ulong current)
+        {
+            OnOwnershipChanged(previous, current);
+        }
+
+        /// <summary>
         /// Gets called when we loose ownership of this object
         /// </summary>
         public virtual void OnLostOwnership() { }
@@ -567,6 +728,25 @@ namespace Unity.Netcode
 
 #pragma warning disable IDE1006 // disable naming rule violation check
         // RuntimeAccessModifiersILPP will make this `protected`
+        internal virtual void __initializeRpcs()
+#pragma warning restore IDE1006 // restore naming rule violation check
+        {
+            // ILPP generates code for all NetworkBehaviour subtypes to initialize each type's RPCs.
+        }
+
+#pragma warning disable IDE1006 // disable naming rule violation check
+        // RuntimeAccessModifiersILPP will make this `protected`
+        internal void __registerRpc(uint hash, RpcReceiveHandler handler, string rpcMethodName)
+#pragma warning restore IDE1006 // restore naming rule violation check
+        {
+            __rpc_func_table[GetType()][hash] = handler;
+#if DEVELOPMENT_BUILD || UNITY_EDITOR
+            __rpc_name_table[GetType()][hash] = rpcMethodName;
+#endif
+        }
+
+#pragma warning disable IDE1006 // disable naming rule violation check
+        // RuntimeAccessModifiersILPP will make this `protected`
         // Using this method here because ILPP doesn't seem to let us do visibility modification on properties.
         internal void __nameNetworkVariable(NetworkVariableBase variable, string varName)
 #pragma warning restore IDE1006 // restore naming rule violation check
@@ -583,6 +763,14 @@ namespace Unity.Netcode
 
             m_VarInit = true;
 
+            if (!__rpc_func_table.ContainsKey(GetType()))
+            {
+                __rpc_func_table[GetType()] = new Dictionary<uint, RpcReceiveHandler>();
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                __rpc_name_table[GetType()] = new Dictionary<uint, string>();
+#endif
+                __initializeRpcs();
+            }
             __initializeVariables();
 
             {
@@ -936,6 +1124,8 @@ namespace Unity.Netcode
                 if (finalPosition == positionBeforeSynchronize || threwException)
                 {
                     writer.Seek(positionBeforeWrite);
+                    // Truncate back to the size before
+                    writer.Truncate();
                     return false;
                 }
                 else

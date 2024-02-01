@@ -85,6 +85,8 @@ namespace Unity.Netcode
         private INetworkMessageSender m_Sender;
         private bool m_Disposed;
 
+        private ulong m_LocalClientId;
+
         internal Type[] MessageTypes => m_ReverseTypeMap;
         internal MessageHandler[] MessageHandlers => m_MessageHandlers;
 
@@ -95,9 +97,21 @@ namespace Unity.Netcode
             return m_MessageTypes[t];
         }
 
+        internal object GetOwner()
+        {
+            return m_Owner;
+        }
+
+        internal void SetLocalClientId(ulong id)
+        {
+            m_LocalClientId = id;
+        }
+
         public const int DefaultNonFragmentedMessageMaxSize = 1300 & ~7; // Round down to nearest word aligned size (1296)
         public int NonFragmentedMessageMaxSize = DefaultNonFragmentedMessageMaxSize;
         public int FragmentedMessageMaxSize = int.MaxValue;
+
+        public Dictionary<ulong, int> PeerMTUSizes = new Dictionary<ulong, int>();
 
         internal struct MessageWithHandler
         {
@@ -497,6 +511,7 @@ namespace Unity.Netcode
             m_SendQueues.Remove(clientId);
 
             m_PerClientMessageVersions.Remove(clientId);
+            PeerMTUSizes.Remove(clientId);
         }
 
         internal void CleanupDisconnectedClients()
@@ -548,7 +563,7 @@ namespace Unity.Netcode
             // Special cases because these are the messages that carry the version info - thus the version info isn't
             // populated yet when we get these. The first part of these messages always has to be the version data
             // and can't change.
-            if (typeof(T) != typeof(ConnectionRequestMessage) && typeof(T) != typeof(ConnectionApprovedMessage) && typeof(T) != typeof(DisconnectReasonMessage))
+            if (typeof(T) != typeof(ConnectionRequestMessage) && typeof(T) != typeof(ConnectionApprovedMessage) && typeof(T) != typeof(DisconnectReasonMessage) && context.SenderId != manager.m_LocalClientId)
             {
                 messageVersion = manager.GetMessageVersion(typeof(T), context.SenderId, true);
                 if (messageVersion < 0)
@@ -678,6 +693,21 @@ namespace Unity.Netcode
                     continue;
                 }
 
+                var startSize = NonFragmentedMessageMaxSize;
+                if (delivery != NetworkDelivery.ReliableFragmentedSequenced)
+                {
+                    if (PeerMTUSizes.TryGetValue(clientId, out var clientMaxSize))
+                    {
+                        maxSize = clientMaxSize;
+                    }
+                    startSize = maxSize;
+                    if (tmpSerializer.Position >= maxSize)
+                    {
+                        Debug.LogError($"MTU size for {clientId} is too small to contain a message of type {typeof(TMessageType).FullName}");
+                        continue;
+                    }
+                }
+
                 for (var hookIdx = 0; hookIdx < m_Hooks.Count; ++hookIdx)
                 {
                     m_Hooks[hookIdx].OnBeforeSendMessage(clientId, ref message, delivery);
@@ -686,7 +716,7 @@ namespace Unity.Netcode
                 var sendQueueItem = m_SendQueues[clientId];
                 if (sendQueueItem.Length == 0)
                 {
-                    sendQueueItem.Add(new SendQueueItem(delivery, NonFragmentedMessageMaxSize, Allocator.TempJob, maxSize));
+                    sendQueueItem.Add(new SendQueueItem(delivery, startSize, Allocator.TempJob, maxSize));
                     sendQueueItem.ElementAt(0).Writer.Seek(sizeof(NetworkBatchHeader));
                 }
                 else
@@ -694,7 +724,7 @@ namespace Unity.Netcode
                     ref var lastQueueItem = ref sendQueueItem.ElementAt(sendQueueItem.Length - 1);
                     if (lastQueueItem.NetworkDelivery != delivery || lastQueueItem.Writer.MaxCapacity - lastQueueItem.Writer.Position < tmpSerializer.Length + headerSerializer.Length)
                     {
-                        sendQueueItem.Add(new SendQueueItem(delivery, NonFragmentedMessageMaxSize, Allocator.TempJob, maxSize));
+                        sendQueueItem.Add(new SendQueueItem(delivery, startSize, Allocator.TempJob, maxSize));
                         sendQueueItem.ElementAt(sendQueueItem.Length - 1).Writer.Seek(sizeof(NetworkBatchHeader));
                     }
                 }
@@ -785,6 +815,12 @@ namespace Unity.Netcode
         }
 
         internal unsafe int SendMessage<T>(ref T message, NetworkDelivery delivery, in NativeArray<ulong> clientIds)
+            where T : INetworkMessage
+        {
+            return SendMessage(ref message, delivery, new PointerListWrapper<ulong>((ulong*)clientIds.GetUnsafePtr(), clientIds.Length));
+        }
+
+        internal unsafe int SendMessage<T>(ref T message, NetworkDelivery delivery, in NativeList<ulong> clientIds)
             where T : INetworkMessage
         {
             return SendMessage(ref message, delivery, new PointerListWrapper<ulong>((ulong*)clientIds.GetUnsafePtr(), clientIds.Length));

@@ -9,14 +9,14 @@ See guides below to install Unity Netcode for GameObjects, set up your project, 
 - [Documentation](https://docs-multiplayer.unity3d.com/netcode/current/about)
 - [Installation](https://docs-multiplayer.unity3d.com/netcode/current/installation)
 - [First Steps](https://docs-multiplayer.unity3d.com/netcode/current/tutorials/get-started-ngo)
-- [API Reference](https://docs-multiplayer.unity3d.com/netcode/current/api/introduction)
+- [API Reference](https://docs.unity3d.com/Packages/com.unity.netcode.gameobjects@1.6/api/index.html)
 
 # Technical details
 
 ## Requirements
 
 Netcode for GameObjects targets the following Unity versions:
-- Unity 2020.3, 2021.1, 2021.2 and 2021.3
+- Unity 2021.3 (LTS), 2022.3 (LTS) and 2023.2
 
 On the following runtime platforms:
 - Windows, MacOS, and Linux

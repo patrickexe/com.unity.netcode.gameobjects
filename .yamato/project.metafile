@@ -1,4 +1,4 @@
-validation_editor: 2020.3
+validation_editor: 2021.3
 mobile_validation_editor: 2021.3
 
 # Platforms that will be tested. The first entry in this array will also
@@ -6,7 +6,7 @@ mobile_validation_editor: 2021.3
 test_platforms:
   - name: win
     type: Unity::VM
-    image: package-ci/win10:stable
+    image: package-ci/win10:v4
     flavor: b1.large
     pathsep: \
     standalone: StandaloneWindows64
@@ -14,7 +14,7 @@ test_platforms:
     utr: .\utr.bat
   - name: mac
     type: Unity::VM::osx
-    image: package-ci/mac:stable
+    image: package-ci/macos-13:v4
     pathsep: /
     standalone: StandaloneOSX
     flavor: b1.large
@@ -22,7 +22,7 @@ test_platforms:
     utr: ./utr
   - name: ubuntu
     type: Unity::VM
-    image: package-ci/ubuntu:stable
+    image: package-ci/ubuntu-22.04:v4
     flavor: b1.large
     pathsep: /
     standalone: StandaloneLinux64
@@ -42,7 +42,6 @@ projects:
       - name: com.unity.netcode.gameobjects
         path: com.unity.netcode.gameobjects
     test_editors:
-      - 2020.3
       - 2021.3
       - 2022.2
       - 2023.1
@@ -56,7 +55,7 @@ projects:
       - name: com.unity.netcode.gameobjects
         path: com.unity.netcode.gameobjects
     test_editors:
-      - 2020.3
+      - 2021.3
   - name: testproject-tools-integration
     path: testproject-tools-integration
     validate: false

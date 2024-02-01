@@ -62,7 +62,7 @@ public class ConnectionModeScript : MonoBehaviour
             {
                 if (NetworkManager.Singleton && !NetworkManager.Singleton.IsListening)
                 {
-                    m_ConnectionModeButtons.SetActive(false);
+                    m_ConnectionModeButtons?.SetActive(false);
                     m_CommandLineProcessor.ProcessCommandLine();
                     break;
                 }
@@ -126,8 +126,8 @@ public class ConnectionModeScript : MonoBehaviour
         if (HasRelaySupport())
         {
             m_JoinCodeInput.SetActive(true);
-            m_ConnectionModeButtons.SetActive(false || AuthenticationService.Instance.IsSignedIn);
-            m_AuthenticationButtons.SetActive(NetworkManager.Singleton && !NetworkManager.Singleton.IsListening && !AuthenticationService.Instance.IsSignedIn);
+            m_ConnectionModeButtons?.SetActive(false || AuthenticationService.Instance.IsSignedIn);
+            m_AuthenticationButtons?.SetActive(NetworkManager.Singleton && !NetworkManager.Singleton.IsListening && !AuthenticationService.Instance.IsSignedIn);
         }
     }
 
@@ -154,7 +154,20 @@ public class ConnectionModeScript : MonoBehaviour
         NetworkManager.Singleton.StartServer();
         NetworkManager.Singleton.SceneManager.SetClientSynchronizationMode(m_ClientSynchronizationMode);
         OnNotifyConnectionEventServer?.Invoke();
-        m_ConnectionModeButtons?.SetActive(false);
+        if (m_ConnectionModeButtons != null)
+        {
+            m_ConnectionModeButtons.SetActive(false);
+            NetworkManager.Singleton.OnServerStopped += OnServerStopped;
+        }
+    }
+
+    private void OnServerStopped(bool obj)
+    {
+        if (m_ConnectionModeButtons != null)
+        {
+            NetworkManager.Singleton.OnServerStopped -= OnServerStopped;
+            m_ConnectionModeButtons.SetActive(true);
+        }
     }
 
 
@@ -164,7 +177,7 @@ public class ConnectionModeScript : MonoBehaviour
     private IEnumerator StartRelayServer(Action postAllocationAction)
     {
 #if ENABLE_RELAY_SERVICE
-        m_ConnectionModeButtons.SetActive(false);
+        m_ConnectionModeButtons?.SetActive(false);
 
         var serverRelayUtilityTask = RelayUtility.AllocateRelayServerAndGetJoinCode(m_MaxConnections);
         while (!serverRelayUtilityTask.IsCompleted)
@@ -214,7 +227,11 @@ public class ConnectionModeScript : MonoBehaviour
         NetworkManager.Singleton.StartHost();
         NetworkManager.Singleton.SceneManager.SetClientSynchronizationMode(m_ClientSynchronizationMode);
         OnNotifyConnectionEventHost?.Invoke();
-        m_ConnectionModeButtons.SetActive(false);
+        if (m_ConnectionModeButtons != null)
+        {
+            m_ConnectionModeButtons.SetActive(false);
+            NetworkManager.Singleton.OnServerStopped += OnServerStopped;
+        }
     }
 
     /// <summary>
@@ -239,8 +256,25 @@ public class ConnectionModeScript : MonoBehaviour
     {
         NetworkManager.Singleton.StartClient();
         OnNotifyConnectionEventClient?.Invoke();
-        m_ConnectionModeButtons.SetActive(false);
-        m_DisconnectClientButton?.SetActive(true);
+        if (m_ConnectionModeButtons)
+        {
+            m_ConnectionModeButtons.SetActive(false);
+            NetworkManager.Singleton.OnClientStopped += OnClientStopped;
+        }
+
+        if (m_DisconnectClientButton)
+        {
+            m_DisconnectClientButton.SetActive(true);
+        }
+    }
+
+    private void OnClientStopped(bool obj)
+    {
+        if (m_ConnectionModeButtons)
+        {
+            NetworkManager.Singleton.OnClientStopped -= OnClientStopped;
+            m_ConnectionModeButtons.SetActive(true);
+        }
     }
 
     public void DisconnectClient()
